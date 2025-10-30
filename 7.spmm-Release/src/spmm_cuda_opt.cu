@@ -14,21 +14,21 @@ void spmm_cuda_opt(int *d_ptr, int *d_idx, float *d_val, float *d_vin, float *d_
 
 	// Forward declare kernel and launch
 	extern __global__ void spmm_kernel_opt_device(const int *ptr, const int *idx, const float *val,
-												  const float *vin, float *vout, int m, int n);
-	spmm_kernel_opt_device<<<grid, block>>>(d_ptr, d_idx, d_val, d_vin, d_vout, m, n);
+												  const float *vin, float *vout, int m, int n, int k);
+	spmm_kernel_opt_device<<<grid, block>>>(d_ptr, d_idx, d_val, d_vin, d_vout, m, n, k);
 }
 
 
 // Each warp computes one output row across N columns in tiles of 64 columns (2 per lane)
 __global__ void spmm_kernel_opt_device(const int *ptr, const int *idx, const float *val,
-									   const float *vin, float *vout, int m, int n)
+									   const float *vin, float *vout, int m, int n, int k)
 {
 	const int lane = threadIdx.x & 31;                // lane id within warp
 	const int warpInBlock = threadIdx.x >> 5;         // warp id within block
 	const int warpsPerBlock = blockDim.x >> 5;
 	// global warp id for grid-stride over rows
 	int warpGlobal = blockIdx.x * warpsPerBlock + warpInBlock;
-	const unsigned FULL_MASK = 0xffffffffu;
+	unsigned mask = __activemask();
 
 	// Grid-stride loop over rows (by warps)
 	for (int row = warpGlobal; row < m; row += gridDim.x * warpsPerBlock)
@@ -56,15 +56,15 @@ __global__ void spmm_kernel_opt_device(const int *ptr, const int *idx, const flo
 					aval = val[p];
 				}
 				// Broadcast the nonzero to the whole warp
-				kcol = __shfl_sync(FULL_MASK, kcol, 0);
-				aval = __shfl_sync(FULL_MASK, aval, 0);
+				kcol = __shfl_sync(mask, kcol, 0);
+				aval = __shfl_sync(mask, aval, 0);
 
 				// Accumulate two columns per lane to increase arithmetic intensity
-				if (c0 < n)
+				if (c0 < n && kcol >= 0 && kcol < k)
 				{
 					acc0 = fmaf(aval, vin[kcol * n + c0], acc0);
 				}
-				if (c1 < n)
+				if (c1 < n && kcol >= 0 && kcol < k)
 				{
 					acc1 = fmaf(aval, vin[kcol * n + c1], acc1);
 				}
