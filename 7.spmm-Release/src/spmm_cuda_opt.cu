@@ -3,6 +3,28 @@
 #include <spmm_cuda_opt.h>
 
 
+// Safety-first kernel: one thread computes one (row, col) output element
+__global__ void spmm_kernel_safe_device(const int *__restrict__ ptr, const int *__restrict__ idx, const float *__restrict__ val,
+										const float *__restrict__ vin, float *__restrict__ vout, int m, int n, int k)
+{
+	int col = blockIdx.x * blockDim.x + threadIdx.x; // output column
+	int row = blockIdx.y * blockDim.y + threadIdx.y; // output row
+	if (row >= m || col >= n) return;
+
+	float acc = 0.0f;
+	int row_start = ptr[row];
+	int row_end   = ptr[row + 1];
+	for (int p = row_start; p < row_end; ++p)
+	{
+		int kk = idx[p];
+		if (kk >= 0 && kk < k)
+		{
+			acc = fmaf(val[p], vin[static_cast<size_t>(kk) * n + col], acc);
+		}
+	}
+	vout[static_cast<size_t>(row) * n + col] = acc;
+}
+
 // Each warp computes one output row across N columns in tiles of 32 columns (1 per lane)
 __global__ void spmm_kernel_opt_device(const int *__restrict__ ptr, const int *__restrict__ idx, const float *__restrict__ val,
 									   const float *__restrict__ vin, float *__restrict__ vout, int m, int n, int k)
@@ -12,7 +34,6 @@ __global__ void spmm_kernel_opt_device(const int *__restrict__ ptr, const int *_
 	const int warpsPerBlock = blockDim.x >> 5;
 	// global warp id for grid-stride over rows
 	int warpGlobal = blockIdx.x * warpsPerBlock + warpInBlock;
-	unsigned full_mask = 0xffffffffu;
 
 	// Grid-stride loop over rows (by warps)
 	for (int row = warpGlobal; row < m; row += gridDim.x * warpsPerBlock)
@@ -30,16 +51,9 @@ __global__ void spmm_kernel_opt_device(const int *__restrict__ ptr, const int *_
 			// Iterate over nonzeros in this row
 			for (int p = row_start; p < row_end; ++p)
 			{
-				int kcol = 0;
-				float aval = 0.0f;
-				if (lane == 0)
-				{
-					kcol = idx[p];
-					aval = val[p];
-				}
-				// Broadcast the nonzero to the whole warp
-				kcol = __shfl_sync(full_mask, kcol, 0);
-				aval = __shfl_sync(full_mask, aval, 0);
+				// Load CSR entry per-lane (redundant across lanes but safe and simple)
+				int kcol = idx[p];
+				float aval = val[p];
 
 				// Accumulate one column per lane
 				if (cj < n && kcol >= 0 && kcol < k)
@@ -60,12 +74,22 @@ __global__ void spmm_kernel_opt_device(const int *__restrict__ ptr, const int *_
 
 void spmm_cuda_opt(int *d_ptr, int *d_idx, float *d_val, float *d_vin, float *d_vout, int m, int n,int k)
 {
-	// Kernel configuration: use multiple warps per block; one warp processes one sparse row
-	const int threadsPerBlock = 256; // 8 warps per block
-	const int warpsPerBlock = threadsPerBlock / 32;
-	dim3 block(threadsPerBlock);
-	dim3 grid((m + warpsPerBlock - 1) / warpsPerBlock);
-
-	spmm_kernel_opt_device<<<grid, block>>>(d_ptr, d_idx, d_val, d_vin, d_vout, m, n, k);
+	// Switchable path: prefer safe kernel for correctness; toggle to opt kernel after validation
+	bool use_safe = true;
+	if (use_safe)
+	{
+		dim3 block(32, 8); // 256 threads; 32 columns x 8 rows per block
+		dim3 grid((n + block.x - 1) / block.x, (m + block.y - 1) / block.y);
+		spmm_kernel_safe_device<<<grid, block>>>(d_ptr, d_idx, d_val, d_vin, d_vout, m, n, k);
+	}
+	else
+	{
+		// Kernel configuration: use multiple warps per block; one warp processes one sparse row
+		const int threadsPerBlock = 256; // 8 warps per block
+		const int warpsPerBlock = threadsPerBlock / 32;
+		dim3 block(threadsPerBlock);
+		dim3 grid((m + warpsPerBlock - 1) / warpsPerBlock);
+		spmm_kernel_opt_device<<<grid, block>>>(d_ptr, d_idx, d_val, d_vout, m, n, k);
+	}
 }
 
